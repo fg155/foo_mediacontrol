@@ -1,0 +1,100 @@
+name: Build foobar x64 - no plugin buttons
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Disable plugin button handling in source
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          root = Path('foobar2000/foo_mediacontrol')
+          controls = root / 'media_controls.cpp'
+          text = controls.read_text(encoding='utf-8-sig')
+          lines = text.splitlines(keepends=True)
+          subscribe = [i for i, line in enumerate(lines) if 'm_controls->ButtonPressed +=' in line]
+          unsubscribe = [i for i, line in enumerate(lines) if 'm_controls->ButtonPressed -=' in line]
+          if len(subscribe) != 1 or len(unsubscribe) != 1:
+              raise RuntimeError('Source differs from the inspected version; stop instead of guessing.')
+          for i in subscribe + unsubscribe:
+              lines[i] = '\t// Experimental build: no plugin ButtonPressed subscription.\n'
+          controls.write_text(''.join(lines), encoding='utf-8')
+
+          listener = root / 'message_listener.cpp'
+          text = listener.read_text(encoding='utf-8-sig')
+          signature = 'bool message_listener::pretranslate_message(MSG* p_msg)'
+          if text.count(signature) != 1:
+              raise RuntimeError('Unexpected message listener source.')
+          start = text.index('{', text.index(signature))
+          depth = 1
+          end = start + 1
+          while depth and end < len(text):
+              depth += (text[end] == '{') - (text[end] == '}')
+              end += 1
+          if depth:
+              raise RuntimeError('Could not locate message listener function body.')
+          body = '{\n\t// Leave media-key messages to the native player.\n\treturn false;\n}'
+          listener.write_text(text[:start] + body + text[end:], encoding='utf-8')
+
+          main = root / 'main.cpp'
+          text = main.read_text(encoding='utf-8-sig')
+          old = '"Windows 10 Media Controls","1.4"'
+          if text.count(old) != 1:
+              raise RuntimeError('Unexpected component version; inspect before building.')
+          main.write_text(text.replace(old, '"Windows 10 Media Controls","1.4-no-buttons-test1"'), encoding='utf-8')
+
+          Path('build-source-commit.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
+          diff = subprocess.check_output(['git', 'diff', '--', str(root)], text=True)
+          Path('source-changes.patch').write_text(diff, encoding='utf-8')
+          print(diff)
+
+      - name: Compile Release x64
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\build\"
+          msbuild foobar2000/foo_mediacontrol/foo_mediacontrol.sln /m /restore /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0.22621.0 "/p:OutDir=$out" /bl:build.binlog /fl /flp:logfile=build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path "$out\foo_mediacontrol.dll")) { throw 'Expected DLL was not produced.' }
+          Get-FileHash "$out\foo_mediacontrol.dll" -Algorithm SHA256 | Format-List | Out-File build-sha256.txt
+
+      - name: Upload experimental DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: foo_mediacontrol-x64-no-buttons-experimental
+          path: |
+            build/foo_mediacontrol.dll
+            build-sha256.txt
+            build-source-commit.txt
+            source-changes.patch
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            build.log
+            build.binlog
+            build-source-commit.txt
+            source-changes.patch
+          if-no-files-found: ignore
+          retention-days: 14
